@@ -3,19 +3,25 @@ import requests
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import yfinance as yf
 from dotenv import load_dotenv
 
 load_dotenv()
-
-API_KEY = os.getenv("FRED_API_KEY")
-
-if not API_KEY:
-    API_KEY = st.secrets["FRED_API_KEY"]
 
 st.set_page_config(
     page_title="Macro Intelligence Dashboard",
     layout="wide"
 )
+
+API_KEY = os.getenv("FRED_API_KEY")
+
+if not API_KEY:
+    API_KEY = st.secrets.get("FRED_API_KEY", None)
+
+if not API_KEY:
+    st.error("FRED API key missing. Add it to .env locally or Streamlit Secrets online.")
+    st.stop()
+
 
 INDICATORS = {
     "Real GDP": "GDPC1",
@@ -28,7 +34,31 @@ INDICATORS = {
     "High Yield Spread": "BAMLH0A0HYM2"
 }
 
+PORTFOLIO = {
+    "AGG": {
+        "name": "iShares Core U.S. Aggregate Bond ETF",
+        "weight": 0.25,
+        "type": "Bond ETF"
+    },
+    "SPAB": {
+        "name": "SPDR Portfolio Aggregate Bond ETF",
+        "weight": 0.25,
+        "type": "Bond ETF"
+    },
+    "GDX": {
+        "name": "VanEck Gold Miners ETF",
+        "weight": 0.25,
+        "type": "Gold Miners"
+    },
+    "SPY": {
+        "name": "SPDR S&P 500 ETF",
+        "weight": 0.25,
+        "type": "Equity ETF"
+    }
+}
 
+
+@st.cache_data(ttl=3600)
 def get_fred_data(series_id):
     url = "https://api.stlouisfed.org/fred/series/observations"
 
@@ -39,6 +69,8 @@ def get_fred_data(series_id):
     }
 
     response = requests.get(url, params=params)
+    response.raise_for_status()
+
     data = response.json()["observations"]
 
     df = pd.DataFrame(data)
@@ -49,12 +81,32 @@ def get_fred_data(series_id):
     return df[["date", "value"]]
 
 
+@st.cache_data(ttl=3600)
+def get_etf_prices(tickers):
+    data = yf.download(
+        tickers,
+        period="1y",
+        auto_adjust=True,
+        progress=False
+    )["Close"]
+
+    if isinstance(data, pd.Series):
+        data = data.to_frame()
+
+    data = data.dropna()
+    return data
+
+
 def calculate_change(df):
     latest = df["value"].iloc[-1]
     previous = df["value"].iloc[-2]
 
     absolute_change = latest - previous
-    pct_change = (absolute_change / previous) * 100
+
+    if previous == 0:
+        pct_change = 0
+    else:
+        pct_change = (absolute_change / previous) * 100
 
     return latest, previous, absolute_change, pct_change
 
@@ -68,6 +120,57 @@ def arrow(pct_change):
         return "→ 0.00%"
 
 
+def get_status(name, value):
+    if name == "Real GDP":
+        if value > 2:
+            return "🟢 Healthy growth"
+        elif value < 0:
+            return "🔴 Recession risk"
+        return "🟡 Slow growth"
+
+    if name == "Nonfarm Payrolls":
+        if value > 150000:
+            return "🟢 Strong labour market"
+        elif value < 0:
+            return "🔴 Job losses"
+        return "🟡 Slowing jobs"
+
+    if name in ["CPI Inflation", "Core PCE"]:
+        if value < 2:
+            return "🟢 Comfortable inflation"
+        elif value > 5:
+            return "🔴 High inflation"
+        return "🟡 Elevated inflation"
+
+    if name == "Fed Funds Rate":
+        if value < 2:
+            return "🟢 Easy policy"
+        elif value > 5:
+            return "🔴 Restrictive policy"
+        return "🟡 Neutral/tight policy"
+
+    if name == "10-Year Treasury":
+        if value < 2:
+            return "🟢 Low rates"
+        elif value > 5:
+            return "🔴 Tight financial conditions"
+        return "🟡 Moderate rates"
+
+    if name == "Yield Curve":
+        if value > 0:
+            return "🟢 Normal curve"
+        return "🔴 Inversion warning"
+
+    if name == "High Yield Spread":
+        if value < 4:
+            return "🟢 Credit confidence"
+        elif value > 6:
+            return "🔴 Credit stress"
+        return "🟡 Watch credit risk"
+
+    return "⚪ No status"
+
+
 def explain_indicator(name, pct_change):
     direction = "up" if pct_change > 0 else "down"
 
@@ -75,9 +178,9 @@ def explain_indicator(name, pct_change):
         "Real GDP": {
             "up": {
                 "meaning": "Economic output is expanding.",
-                "demand": "Demand side: consumers and businesses are spending more.",
+                "demand": "Demand side: consumers, businesses, and government may be spending more.",
                 "supply": "Supply side: firms are producing more goods and services.",
-                "impact": "Usually positive for growth, jobs, and corporate earnings."
+                "impact": "Positive for growth, employment, and corporate earnings."
             },
             "down": {
                 "meaning": "Economic output is weakening.",
@@ -86,13 +189,12 @@ def explain_indicator(name, pct_change):
                 "impact": "Raises slowdown or recession concerns."
             }
         },
-
         "Nonfarm Payrolls": {
             "up": {
                 "meaning": "The labour market is adding jobs.",
                 "demand": "Demand side: household income and consumption can rise.",
                 "supply": "Supply side: more workers support more production.",
-                "impact": "Positive for growth, but very strong jobs can keep inflation sticky."
+                "impact": "Good for growth, but very strong jobs can keep inflation sticky."
             },
             "down": {
                 "meaning": "Job growth is weakening.",
@@ -101,37 +203,34 @@ def explain_indicator(name, pct_change):
                 "impact": "Raises concern about slower economic activity."
             }
         },
-
         "CPI Inflation": {
             "up": {
-                "meaning": "Inflation pressure is rising.",
-                "demand": "Demand side: spending may be too strong relative to supply.",
-                "supply": "Supply side: input costs or supply bottlenecks may be pushing prices up.",
+                "meaning": "Headline inflation pressure is rising.",
+                "demand": "Demand side: spending may be strong relative to supply.",
+                "supply": "Supply side: input costs or bottlenecks may be pushing prices up.",
                 "impact": "The Fed may stay restrictive for longer."
             },
             "down": {
-                "meaning": "Inflation pressure is cooling.",
+                "meaning": "Headline inflation pressure is cooling.",
                 "demand": "Demand side: spending pressure may be easing.",
                 "supply": "Supply side: supply conditions may be improving.",
-                "impact": "This can support future rate cuts if the trend continues."
+                "impact": "Can support future rate cuts if the trend continues."
             }
         },
-
         "Core PCE": {
             "up": {
                 "meaning": "Underlying inflation is rising.",
                 "demand": "Demand side: services demand may remain strong.",
-                "supply": "Supply side: wage and input cost pressures may persist.",
+                "supply": "Supply side: wage and input cost pressure may persist.",
                 "impact": "Important because the Fed watches Core PCE closely."
             },
             "down": {
                 "meaning": "Underlying inflation is cooling.",
                 "demand": "Demand side: price pressure from spending is easing.",
                 "supply": "Supply side: cost pressure may be improving.",
-                "impact": "This is positive for monetary policy easing."
+                "impact": "Positive for possible monetary policy easing."
             }
         },
-
         "Fed Funds Rate": {
             "up": {
                 "meaning": "Monetary policy is becoming tighter.",
@@ -143,15 +242,14 @@ def explain_indicator(name, pct_change):
                 "meaning": "Monetary policy is becoming easier.",
                 "demand": "Demand side: cheaper credit can support spending.",
                 "supply": "Supply side: firms may invest and expand more.",
-                "impact": "Supports growth but can re-ignite inflation if too aggressive."
+                "impact": "Supports growth, but may re-ignite inflation if too aggressive."
             }
         },
-
         "10-Year Treasury": {
             "up": {
                 "meaning": "Long-term rates are rising.",
                 "demand": "Demand side: mortgages and loans become more expensive.",
-                "supply": "Supply side: business investment may become less attractive.",
+                "supply": "Supply side: business investment becomes less attractive.",
                 "impact": "Tightens financial conditions."
             },
             "down": {
@@ -161,7 +259,6 @@ def explain_indicator(name, pct_change):
                 "impact": "Can support housing, stocks, and long-term investment."
             }
         },
-
         "Yield Curve": {
             "up": {
                 "meaning": "The yield curve is becoming healthier.",
@@ -176,7 +273,6 @@ def explain_indicator(name, pct_change):
                 "impact": "A negative curve is a recession warning."
             }
         },
-
         "High Yield Spread": {
             "up": {
                 "meaning": "Credit risk is rising.",
@@ -196,140 +292,330 @@ def explain_indicator(name, pct_change):
     return explanations[name][direction]
 
 
-def get_status(name, value):
-    if name == "Real GDP":
-        return "🟢 Healthy growth" if value > 2 else "🔴 Recession risk" if value < 0 else "🟡 Slow growth"
+def portfolio_impact(indicator, pct_change):
+    direction = "increased" if pct_change > 0 else "decreased"
 
-    if name == "Nonfarm Payrolls":
-        return "🟢 Strong labour market" if value > 150000 else "🔴 Job losses" if value < 0 else "🟡 Slowing jobs"
+    impacts = {
+        "Fed Funds Rate": {
+            "increased": {
+                "AGG": "Negative: higher policy rates usually pressure bond prices.",
+                "SPAB": "Negative: higher rates usually pressure aggregate bonds.",
+                "GDX": "Negative/Mixed: higher real rates can hurt gold-related assets.",
+                "SPY": "Negative: higher discount rates can pressure equity valuations.",
+                "portfolio": "Overall negative. Bonds and equities may both face pressure."
+            },
+            "decreased": {
+                "AGG": "Positive: falling rates usually support bond prices.",
+                "SPAB": "Positive: lower rates support aggregate bonds.",
+                "GDX": "Positive/Mixed: lower rates can support gold miners.",
+                "SPY": "Positive: lower discount rates can support equities.",
+                "portfolio": "Generally positive across bonds, equities, and gold miners."
+            }
+        },
+        "CPI Inflation": {
+            "increased": {
+                "AGG": "Negative: inflation can push yields higher and hurt bonds.",
+                "SPAB": "Negative: inflation can pressure aggregate bonds.",
+                "GDX": "Positive/Mixed: gold miners may benefit from inflation fears.",
+                "SPY": "Negative/Mixed: inflation can pressure margins and valuations.",
+                "portfolio": "Mixed, but usually risky for bonds and equities."
+            },
+            "decreased": {
+                "AGG": "Positive: lower inflation can support bonds.",
+                "SPAB": "Positive: lower inflation supports bond prices.",
+                "GDX": "Negative/Mixed: lower inflation can reduce gold demand.",
+                "SPY": "Positive: lower inflation may support rate-cut expectations.",
+                "portfolio": "Generally positive, especially for bonds and equities."
+            }
+        },
+        "Core PCE": {
+            "increased": {
+                "AGG": "Negative: sticky inflation may keep rates high.",
+                "SPAB": "Negative: bond prices may face pressure.",
+                "GDX": "Mixed: inflation supports gold, but high real rates can hurt.",
+                "SPY": "Negative: the Fed may stay restrictive.",
+                "portfolio": "Cautious. Sticky inflation can delay rate cuts."
+            },
+            "decreased": {
+                "AGG": "Positive: cooling inflation supports bonds.",
+                "SPAB": "Positive: lower inflation supports fixed income.",
+                "GDX": "Mixed: lower inflation may weaken gold demand.",
+                "SPY": "Positive: easier Fed expectations can support equities.",
+                "portfolio": "Generally positive for bonds and equities."
+            }
+        },
+        "10-Year Treasury": {
+            "increased": {
+                "AGG": "Negative: bond prices fall when yields rise.",
+                "SPAB": "Negative: bond prices fall when yields rise.",
+                "GDX": "Negative: higher real yields can hurt gold miners.",
+                "SPY": "Negative: higher yields pressure equity valuations.",
+                "portfolio": "Negative across most exposures."
+            },
+            "decreased": {
+                "AGG": "Positive: bond prices rise when yields fall.",
+                "SPAB": "Positive: bond prices rise when yields fall.",
+                "GDX": "Positive: lower yields can support gold miners.",
+                "SPY": "Positive: lower yields support valuation multiples.",
+                "portfolio": "Positive across most of the portfolio."
+            }
+        },
+        "High Yield Spread": {
+            "increased": {
+                "AGG": "Mixed/Defensive: high-quality bonds may hold up better.",
+                "SPAB": "Mixed/Defensive: aggregate bonds may be safer than equities.",
+                "GDX": "Negative/Mixed: risk-off conditions can hurt miners.",
+                "SPY": "Negative: wider spreads signal credit stress.",
+                "portfolio": "Risk-off signal. SPY and GDX are vulnerable."
+            },
+            "decreased": {
+                "AGG": "Mixed: bonds may lag risk assets.",
+                "SPAB": "Mixed: safe bonds may lag when risk appetite improves.",
+                "GDX": "Positive/Mixed: easier conditions can help miners.",
+                "SPY": "Positive: tighter spreads support equities.",
+                "portfolio": "Risk-on signal, mainly helping SPY and possibly GDX."
+            }
+        }
+    }
 
-    if name in ["CPI Inflation", "Core PCE"]:
-        return "🟢 Comfortable inflation" if value < 2 else "🔴 High inflation" if value > 5 else "🟡 Elevated inflation"
+    if indicator not in impacts:
+        return None
 
-    if name == "Fed Funds Rate":
-        return "🟢 Easy policy" if value < 2 else "🔴 Restrictive policy" if value > 5 else "🟡 Neutral/tight policy"
+    return impacts[indicator][direction]
 
-    if name == "10-Year Treasury":
-        return "🟢 Low rates" if value < 2 else "🔴 Tight financial conditions" if value > 5 else "🟡 Moderate rates"
 
-    if name == "Yield Curve":
-        return "🟢 Normal curve" if value > 0 else "🔴 Inversion warning"
+def calculate_portfolio_returns(price_data):
+    daily_returns = price_data.pct_change().dropna()
 
-    if name == "High Yield Spread":
-        return "🟢 Credit confidence" if value < 4 else "🔴 Credit stress" if value > 6 else "🟡 Watch credit risk"
+    weights = pd.Series({
+        ticker: details["weight"]
+        for ticker, details in PORTFOLIO.items()
+    })
 
-    return "⚪ No status"
+    portfolio_returns = daily_returns.dot(weights)
+    cumulative_returns = (1 + portfolio_returns).cumprod() - 1
+
+    return daily_returns, portfolio_returns, cumulative_returns
 
 
 st.title("📊 Macro Intelligence Dashboard")
-st.caption("FRED API dashboard with change, interpretation, demand-side impact, and supply-side impact.")
+st.caption("FRED API dashboard with macro interpretation and portfolio impact analysis.")
 
-st.sidebar.title("Choose Indicator")
-selected_indicator = st.sidebar.selectbox("Indicator", list(INDICATORS.keys()))
+st.sidebar.title("Navigation")
+
+page = st.sidebar.radio(
+    "Choose dashboard",
+    [
+        "Macro Dashboard",
+        "Portfolio Impact Dashboard"
+    ]
+)
+
+selected_indicator = st.sidebar.selectbox(
+    "Choose macro indicator",
+    list(INDICATORS.keys())
+)
 
 all_data = {}
 
 for name, code in INDICATORS.items():
     all_data[name] = get_fred_data(code)
 
-st.subheader("📌 Macro KPI Cards")
-
-cols = st.columns(4)
-
-for i, (name, code) in enumerate(INDICATORS.items()):
-    df = all_data[name]
-    latest, previous, absolute_change, pct_change = calculate_change(df)
-    latest_date = df["date"].iloc[-1].strftime("%d %b %Y")
-    status = get_status(name, latest)
-
-    with cols[i % 4]:
-        st.metric(
-            label=f"{name} ({code})",
-            value=f"{latest:,.2f}",
-            delta=arrow(pct_change)
-        )
-        st.write(status)
-        st.caption(f"Latest date: {latest_date}")
-
-st.divider()
-
-st.subheader(f"📈 Interactive Chart: {selected_indicator}")
-
 selected_df = all_data[selected_indicator]
 selected_code = INDICATORS[selected_indicator]
-
-fig = px.line(
-    selected_df,
-    x="date",
-    y="value",
-    title=f"{selected_indicator} ({selected_code}) over time"
-)
-
-st.plotly_chart(fig, use_container_width=True)
-
 latest, previous, absolute_change, pct_change = calculate_change(selected_df)
-explanation = explain_indicator(selected_indicator, pct_change)
 
-st.subheader("🧠 Economic Interpretation")
 
-col1, col2 = st.columns(2)
+if page == "Macro Dashboard":
 
-with col1:
-    st.metric("Latest Value", f"{latest:,.2f}")
-    st.metric("Previous Value", f"{previous:,.2f}")
-    st.metric("Change", f"{absolute_change:,.2f}", arrow(pct_change))
+    st.subheader("📌 Macro KPI Cards")
 
-with col2:
-    st.write(f"**Meaning:** {explanation['meaning']}")
-    st.write(f"**Demand Impact:** {explanation['demand']}")
-    st.write(f"**Supply Impact:** {explanation['supply']}")
-    st.write(f"**Economic Impact:** {explanation['impact']}")
+    cols = st.columns(4)
 
-st.divider()
+    for i, (name, code) in enumerate(INDICATORS.items()):
+        df = all_data[name]
+        latest_i, previous_i, absolute_change_i, pct_change_i = calculate_change(df)
+        latest_date = df["date"].iloc[-1].strftime("%d %b %Y")
+        status = get_status(name, latest_i)
 
-st.subheader("📋 Business Cycle Scorecard")
+        with cols[i % 4]:
+            st.metric(
+                label=f"{name} ({code})",
+                value=f"{latest_i:,.2f}",
+                delta=arrow(pct_change_i)
+            )
+            st.write(status)
+            st.caption(f"Latest date: {latest_date}")
 
-scorecard_rows = []
+    st.divider()
 
-for name, code in INDICATORS.items():
-    df = all_data[name]
-    latest, previous, absolute_change, pct_change = calculate_change(df)
-    latest_date = df["date"].iloc[-1].strftime("%d %b %Y")
-    status = get_status(name, latest)
-    explanation = explain_indicator(name, pct_change)
+    st.subheader(f"📈 Interactive Chart: {selected_indicator}")
 
-    scorecard_rows.append({
-        "Indicator": name,
-        "Code": code,
-        "Latest": round(latest, 2),
-        "% Change": round(pct_change, 2),
-        "Status": status,
-        "Demand Side": explanation["demand"],
-        "Supply Side": explanation["supply"],
-        "Economic Impact": explanation["impact"],
-        "Date": latest_date
-    })
+    fig = px.line(
+        selected_df,
+        x="date",
+        y="value",
+        title=f"{selected_indicator} ({selected_code}) over time"
+    )
 
-scorecard = pd.DataFrame(scorecard_rows)
+    st.plotly_chart(fig, use_container_width=True)
 
-st.dataframe(scorecard, use_container_width=True)
+    explanation = explain_indicator(selected_indicator, pct_change)
 
-st.divider()
+    st.subheader("🧠 Economic Interpretation")
 
-st.subheader("🧠 Overall Economic Regime")
+    col1, col2 = st.columns(2)
 
-bad_signals = scorecard["Status"].str.contains("🔴").sum()
-warning_signals = scorecard["Status"].str.contains("🟡").sum()
+    with col1:
+        st.metric("Latest Value", f"{latest:,.2f}")
+        st.metric("Previous Value", f"{previous:,.2f}")
+        st.metric("Change", f"{absolute_change:,.2f}", arrow(pct_change))
 
-if bad_signals >= 3:
-    regime = "🔴 Recession / Stress"
-elif bad_signals >= 1 or warning_signals >= 4:
-    regime = "🟠 Slowdown / Late Cycle"
-elif warning_signals >= 2:
-    regime = "🟡 Mid-cycle Caution"
-else:
-    regime = "🟢 Expansion"
+    with col2:
+        st.write(f"**Meaning:** {explanation['meaning']}")
+        st.write(f"**Demand Impact:** {explanation['demand']}")
+        st.write(f"**Supply Impact:** {explanation['supply']}")
+        st.write(f"**Economic Impact:** {explanation['impact']}")
 
-st.header(regime)
+    st.divider()
 
-st.caption("This is a simple rule-based regime reading using the 8 macro indicators.")
+    st.subheader("📋 Business Cycle Scorecard")
+
+    scorecard_rows = []
+
+    for name, code in INDICATORS.items():
+        df = all_data[name]
+        latest_i, previous_i, absolute_change_i, pct_change_i = calculate_change(df)
+        latest_date = df["date"].iloc[-1].strftime("%d %b %Y")
+        status = get_status(name, latest_i)
+        explanation_i = explain_indicator(name, pct_change_i)
+
+        scorecard_rows.append({
+            "Indicator": name,
+            "Code": code,
+            "Latest": round(latest_i, 2),
+            "% Change": round(pct_change_i, 2),
+            "Status": status,
+            "Demand Side": explanation_i["demand"],
+            "Supply Side": explanation_i["supply"],
+            "Economic Impact": explanation_i["impact"],
+            "Date": latest_date
+        })
+
+    scorecard = pd.DataFrame(scorecard_rows)
+
+    st.dataframe(scorecard, use_container_width=True)
+
+    st.divider()
+
+    st.subheader("🧠 Overall Economic Regime")
+
+    bad_signals = scorecard["Status"].str.contains("🔴").sum()
+    warning_signals = scorecard["Status"].str.contains("🟡").sum()
+
+    if bad_signals >= 3:
+        regime = "🔴 Recession / Stress"
+    elif bad_signals >= 1 or warning_signals >= 4:
+        regime = "🟠 Slowdown / Late Cycle"
+    elif warning_signals >= 2:
+        regime = "🟡 Mid-cycle Caution"
+    else:
+        regime = "🟢 Expansion"
+
+    st.header(regime)
+    st.caption("Simple rule-based regime reading using the 8 macro indicators.")
+
+
+if page == "Portfolio Impact Dashboard":
+
+    st.subheader("💼 Portfolio Impact Dashboard")
+
+    st.write("Equal-weighted portfolio: AGG, SPAB, GDX, SPY — 25% each.")
+
+    tickers = list(PORTFOLIO.keys())
+
+    try:
+        prices = get_etf_prices(tickers)
+        daily_returns, portfolio_returns, cumulative_returns = calculate_portfolio_returns(prices)
+
+        latest_prices = prices.iloc[-1]
+        previous_prices = prices.iloc[-2]
+        one_day_returns = ((latest_prices / previous_prices) - 1) * 100
+
+        cols = st.columns(4)
+
+        for i, ticker in enumerate(tickers):
+            with cols[i]:
+                st.metric(
+                    label=f"{ticker} | {PORTFOLIO[ticker]['type']}",
+                    value=f"${latest_prices[ticker]:.2f}",
+                    delta=f"{one_day_returns[ticker]:.2f}%"
+                )
+                st.caption(PORTFOLIO[ticker]["name"])
+                st.write(f"Weight: {PORTFOLIO[ticker]['weight'] * 100:.0f}%")
+
+        st.divider()
+
+        st.subheader("📈 Portfolio Performance")
+
+        portfolio_df = cumulative_returns.reset_index()
+        portfolio_df.columns = ["Date", "Portfolio Return"]
+
+        fig_portfolio = px.line(
+            portfolio_df,
+            x="Date",
+            y="Portfolio Return",
+            title="1-Year Cumulative Portfolio Return"
+        )
+
+        st.plotly_chart(fig_portfolio, use_container_width=True)
+
+        st.divider()
+
+    except Exception as e:
+        st.warning("Could not load ETF price data from Yahoo Finance.")
+        st.write(e)
+
+    st.subheader(f"🧠 Portfolio Impact from {selected_indicator}")
+
+    st.metric(
+        label=f"{selected_indicator} Change",
+        value=f"{absolute_change:,.2f}",
+        delta=arrow(pct_change)
+    )
+
+    impact = portfolio_impact(selected_indicator, pct_change)
+
+    if impact:
+        cols = st.columns(4)
+
+        for i, ticker in enumerate(PORTFOLIO.keys()):
+            with cols[i]:
+                st.markdown(f"### {ticker}")
+                st.write(f"**Asset Type:** {PORTFOLIO[ticker]['type']}")
+                st.write(f"**Weight:** {PORTFOLIO[ticker]['weight'] * 100:.0f}%")
+                st.write(impact[ticker])
+
+        st.info(f"**Overall Portfolio Impact:** {impact['portfolio']}")
+
+    else:
+        st.warning(
+            "Portfolio impact logic is strongest for Fed Funds, CPI, Core PCE, "
+            "10-Year Treasury, and High Yield Spread."
+        )
+
+    st.divider()
+
+    st.subheader("📋 Portfolio Allocation")
+
+    allocation_df = pd.DataFrame([
+        {
+            "Ticker": ticker,
+            "ETF Name": details["name"],
+            "Asset Type": details["type"],
+            "Weight": f"{details['weight'] * 100:.0f}%"
+        }
+        for ticker, details in PORTFOLIO.items()
+    ])
+
+    st.dataframe(allocation_df, use_container_width=True)
