@@ -9,6 +9,9 @@ load_dotenv()
 
 API_KEY = os.getenv("FRED_API_KEY")
 
+if not API_KEY:
+    API_KEY = st.secrets["FRED_API_KEY"]
+
 st.set_page_config(
     page_title="Macro Intelligence Dashboard",
     layout="wide"
